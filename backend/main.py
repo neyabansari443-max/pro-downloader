@@ -4,6 +4,7 @@ import asyncio
 import re
 import threading
 import time
+import urllib.request # Keep-alive ke liye
 from typing import Optional, Dict, Union
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
@@ -33,7 +34,10 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 TEMP_FILE_MAX_AGE_SECONDS = int(os.getenv("TEMP_FILE_MAX_AGE_SECONDS", "3600"))  # 1 hour
 TEMP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("TEMP_CLEANUP_INTERVAL_SECONDS", "1800"))  # 30 min
 
-# In-memory job store (Note: For production, use a real database like SQLite/PostgreSQL)
+# Render URL for Keep-Alive (Apna Render URL yahan confirm kar lena)
+RENDER_APP_URL = os.getenv("RENDER_EXTERNAL_URL", "https://pro-downloader-8fx4.onrender.com")
+
+# In-memory job store
 jobs: Dict[str, Dict] = {}
 
 YOUTUBE_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
@@ -52,6 +56,20 @@ class DownloadRequest(BaseModel):
     url: str
     height: Optional[int] = None
     type: str = "video"
+
+# --- Keep Alive Logic (New Feature) ---
+def keep_alive_loop():
+    """Har 10 minute me server ko khud ping karega taaki wo sleep mode me na jaye"""
+    while True:
+        time.sleep(600) # 10 Minutes wait
+        try:
+            print(f"⏰ Keep-Alive: Pinging {RENDER_APP_URL}/health ...")
+            with urllib.request.urlopen(f"{RENDER_APP_URL}/health") as response:
+                print(f"✅ Keep-Alive: Success (Status {response.getcode()})")
+        except Exception as e:
+            print(f"⚠️ Keep-Alive Error: {e}")
+
+# --- Helper Functions (No Logic Removed) ---
 
 def initialize_phases(dl_type: str) -> Dict[str, Dict[str, Union[str, float]]]:
     if dl_type == 'audio':
@@ -112,7 +130,6 @@ def simulate_phase_progress(job_id: str, phase_key: str) -> None:
             time.sleep(0.6)
     threading.Thread(target=_runner, daemon=True).start()
 
-# --- Helper functions ---
 async def delete_file_delayed(path: str, delay: int = 60):
     """Deletes a file after a delay to ensure serving is complete."""
     await asyncio.sleep(delay)
@@ -143,7 +160,7 @@ def stream_file_and_cleanup(job_id: str, path: str, chunk_size: int = 1024 * 102
         jobs.pop(job_id, None)
 
 def cleanup_temp_dir(max_age_seconds: int = TEMP_FILE_MAX_AGE_SECONDS) -> int:
-    """Delete files in TEMP_DIR older than max_age_seconds. Returns number of deleted files."""
+    """Delete files in TEMP_DIR older than max_age_seconds."""
     now = time.time()
     deleted = 0
     try:
@@ -158,7 +175,6 @@ def cleanup_temp_dir(max_age_seconds: int = TEMP_FILE_MAX_AGE_SECONDS) -> int:
                 os.remove(full_path)
                 deleted += 1
             except Exception:
-                # Ignore locked/in-use files; they'll be handled on a later pass
                 continue
     except Exception:
         return deleted
@@ -175,9 +191,16 @@ async def temp_cleanup_loop() -> None:
             pass
         await asyncio.sleep(TEMP_CLEANUP_INTERVAL_SECONDS)
 
+# --- Startup Events ---
 @app.on_event("startup")
-async def start_temp_cleanup() -> None:
+async def startup_events() -> None:
+    # 1. Start Temp Cleaner
     asyncio.create_task(temp_cleanup_loop())
+    
+    # 2. Start Keep-Alive Pinger (Background Thread)
+    # Ye thread server start hone ke baad background me chalta rahega
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
+    print("✅ Keep-Alive System Started")
 
 def ydl_progress_hook(d, job_id):
     """Update per-phase progress for the active job."""
@@ -237,12 +260,18 @@ def ydl_postprocessor_hook(d, job_id):
 
 # --- Routes ---
 
+# Health Check Route (Keep-Alive ke liye zaroori)
+@app.get("/health")
+async def health_check():
+    return {"status": "alive"}
+
 @app.post("/info")
 async def get_video_info(request: VideoInfoRequest):
     try:
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': 'cookies.txt', # <-- Added Cookies Here
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(request.url, download=False)
@@ -250,18 +279,16 @@ async def get_video_info(request: VideoInfoRequest):
             formats_list = []
             
             if request.type == 'audio':
-                # For audio, we just need one good option
                 formats_list.append({
                     'format_id': 'bestaudio',
-                    'height': 0, # Signal it's audio
-                    'ext': 'mp3', # We will convert to mp3
+                    'height': 0, 
+                    'ext': 'mp3', 
                     'filesize': None,
                     'note': 'High Quality Audio (MP3)',
                     'delivery': 'server',
                     'direct_url': None,
                 })
             else:
-                # For video, filter resolutions
                 seen_res = set()
                 available_formats = info.get('formats', [])
                 available_formats.sort(key=lambda x: x.get('height') or 0, reverse=True)
@@ -298,7 +325,6 @@ async def get_video_info(request: VideoInfoRequest):
                 for f in available_formats:
                     height = f.get('height')
                     if not height: continue
-                    # Only allow standard resolutions
                     if height not in seen_res and height in [2160, 1440, 1080, 720, 480]:
                         progressive = pick_progressive(height) if height <= 720 else None
                         direct_url = progressive.get('url') if progressive else None
@@ -321,11 +347,11 @@ async def get_video_info(request: VideoInfoRequest):
                 "formats": formats_list
             }
     except Exception as e:
-        # Clean up error message
         msg = str(e).replace('ERROR:', '').strip().split(';')[0]
         raise HTTPException(status_code=400, detail=msg)
 
-def process_download(job_id: str, url: str, height: Optional[int], dl_type: str):
+async def process_download(job_id: str, url: str, height: Optional[int], dl_type: str):
+    # REMOVED SEMAPHORE: Ab yahan koi Lock nahi hai.
     try:
         jobs[job_id]['status'] = 'starting'
         jobs[job_id]['progress'] = 0
@@ -336,7 +362,7 @@ def process_download(job_id: str, url: str, height: Optional[int], dl_type: str)
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
-            # Add progress hook
+            'cookiefile': 'cookies.txt', # <-- Added Cookies Here
             'progress_hooks': [lambda d: ydl_progress_hook(d, job_id)],
             'postprocessor_hooks': [lambda d: ydl_postprocessor_hook(d, job_id)],
         }
@@ -351,7 +377,6 @@ def process_download(job_id: str, url: str, height: Optional[int], dl_type: str)
                 }],
             })
         else:
-            # Video mode: Merge best video at requested height + best audio
             format_str = f"bestvideo[height={height}]+bestaudio/best[height={height}]/best"
             ydl_opts.update({
                 'format': format_str,
@@ -363,15 +388,12 @@ def process_download(job_id: str, url: str, height: Optional[int], dl_type: str)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             
-            # Find the actual file created
             filename = None
             if dl_type == 'audio':
-                 # yt-dlp postprocessor changes extension to mp3
                  potential_filename = os.path.join(TEMP_DIR, f"{job_id}.mp3")
                  if os.path.exists(potential_filename):
                      filename = potential_filename
             else:
-                 # Video merged to mp4
                  potential_filename = os.path.join(TEMP_DIR, f"{job_id}.mp4")
                  if os.path.exists(potential_filename):
                      filename = potential_filename
@@ -396,7 +418,6 @@ def process_download(job_id: str, url: str, height: Optional[int], dl_type: str)
             if phase['status'] != 'completed':
                 phase['status'] = 'failed'
 
-        # Best-effort cleanup for partial leftovers (.part, temp fragments)
         try:
             for name in os.listdir(TEMP_DIR):
                 if name.startswith(job_id + "."):
@@ -409,7 +430,6 @@ def process_download(job_id: str, url: str, height: Optional[int], dl_type: str)
 
 @app.post("/download")
 async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    # Basic server-side validation again
     if not re.match(YOUTUBE_REGEX, request.url):
          raise HTTPException(status_code=400, detail="Invalid URL")
 
@@ -440,11 +460,9 @@ async def get_file(job_id: str, background_tasks: BackgroundTasks):
     ext = "mp3" if jobs[job_id]['type'] == 'audio' else "mp4"
     media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
 
-    # Sanitize filename for download headers
-    safe_title = re.sub(r'[\\/*?:"<>|]', "", title) # Remove bad characters
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
     safe_filename = f"{safe_title}.{ext}"
     
-    # Fallback cleanup in case client disconnect prevents generator finalizer
     background_tasks.add_task(delete_file_delayed, filename, delay=600)
 
     file_size = None
