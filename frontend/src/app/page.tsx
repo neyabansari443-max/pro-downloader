@@ -40,6 +40,15 @@ interface PhaseState extends PhasePayload {
 const YOUTUBE_REGEX = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/;
 
 export default function Home() {
+  const RENDER_API = "https://pro-downloader-8fx4.onrender.com";
+  const API_BASE = (
+    process.env.NEXT_PUBLIC_API_BASE_URL ||
+    (typeof window !== "undefined" && window.location.hostname.endsWith("vercel.app")
+      ? RENDER_API
+      : "http://localhost:8000")
+  ).replace(/\/$/, "");
+  const apiUrl = (path: string) => `${API_BASE}${path}`;
+
   // --- State ---
   const [url, setUrl] = useState("");
   const [downloadType, setDownloadType] = useState<DownloadType>('video');
@@ -93,7 +102,7 @@ export default function Home() {
     setProcessingJob(null);
 
     try {
-      const res = await fetch("http://localhost:8000/info", {
+      const res = await fetch(apiUrl("/info"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, type: downloadType }),
@@ -117,7 +126,7 @@ export default function Home() {
   const pollStatus = async (jobId: string) => {
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`http://localhost:8000/status/${jobId}`);
+        const res = await fetch(apiUrl(`/status/${jobId}`));
         if (!res.ok) throw new Error("Lost connection");
         
         const data = await res.json();
@@ -140,7 +149,7 @@ export default function Home() {
           clearInterval(interval);
           setProgress(100);
           setTimeout(() => {
-              window.location.href = `http://localhost:8000/file/${jobId}`;
+              window.location.href = apiUrl(`/file/${jobId}`);
               setProcessingJob(null);
               setProgress(0);
               setPhaseStates([]);
@@ -168,7 +177,7 @@ export default function Home() {
     setError(null);
 
     try {
-      const res = await fetch("http://localhost:8000/download", {
+      const res = await fetch(apiUrl("/download"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url, height, type: downloadType }),
