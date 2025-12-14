@@ -1,0 +1,470 @@
+import os
+import uuid
+import asyncio
+import re
+import threading
+import time
+from typing import Optional, Dict, Union
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, validator
+import yt_dlp
+import static_ffmpeg
+
+# Initialize static ffmpeg
+static_ffmpeg.add_paths()
+
+app = FastAPI()
+
+# Enable CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+TEMP_DIR = "temp_downloads"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Temp cleanup settings (safe defaults)
+TEMP_FILE_MAX_AGE_SECONDS = int(os.getenv("TEMP_FILE_MAX_AGE_SECONDS", "3600"))  # 1 hour
+TEMP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("TEMP_CLEANUP_INTERVAL_SECONDS", "1800"))  # 30 min
+
+# In-memory job store (Note: For production, use a real database like SQLite/PostgreSQL)
+jobs: Dict[str, Dict] = {}
+
+YOUTUBE_REGEX = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+
+class VideoInfoRequest(BaseModel):
+    url: str
+    type: str = "video" # video or audio
+
+    @validator('url')
+    def validate_youtube_url(cls, v):
+        if not re.match(YOUTUBE_REGEX, v):
+            raise ValueError('Invalid YouTube URL specified')
+        return v
+
+class DownloadRequest(BaseModel):
+    url: str
+    height: Optional[int] = None
+    type: str = "video"
+
+def initialize_phases(dl_type: str) -> Dict[str, Dict[str, Union[str, float]]]:
+    if dl_type == 'audio':
+        return {
+            'audio_download': {
+                'label': 'Audio Download',
+                'status': 'pending',
+                'progress': 0.0,
+            },
+            'processing': {
+                'label': 'Audio Processing',
+                'status': 'pending',
+                'progress': 0.0,
+            }
+        }
+    return {
+        'video_download': {
+            'label': 'Video Download',
+            'status': 'pending',
+            'progress': 0.0,
+        },
+        'audio_download': {
+            'label': 'Audio Download',
+            'status': 'pending',
+            'progress': 0.0,
+        },
+        'merging': {
+            'label': 'Merging Streams',
+            'status': 'pending',
+            'progress': 0.0,
+        }
+    }
+
+def update_overall_progress(job_id: str) -> None:
+    job = jobs.get(job_id)
+    if not job:
+        return
+    phases = job.get('phases', {})
+    if not phases:
+        return
+    total = sum(phase.get('progress', 0.0) for phase in phases.values())
+    job['progress'] = round(total / len(phases), 2)
+
+def simulate_phase_progress(job_id: str, phase_key: str) -> None:
+    def _runner():
+        while True:
+            job = jobs.get(job_id)
+            if not job:
+                break
+            phase = job.get('phases', {}).get(phase_key)
+            if not phase or phase.get('status') != 'processing':
+                break
+            current = phase.get('progress', 0.0)
+            if current >= 95:
+                break
+            phase['progress'] = min(95.0, current + 5.0)
+            update_overall_progress(job_id)
+            time.sleep(0.6)
+    threading.Thread(target=_runner, daemon=True).start()
+
+# --- Helper functions ---
+async def delete_file_delayed(path: str, delay: int = 60):
+    """Deletes a file after a delay to ensure serving is complete."""
+    await asyncio.sleep(delay)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"Cleaned up file: {path}")
+    except Exception as e:
+        print(f"Error cleaning up file {path}: {e}")
+
+def stream_file_and_cleanup(job_id: str, path: str, chunk_size: int = 1024 * 1024):
+    """Stream a file in chunks and delete it as soon as streaming ends."""
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"Cleaned up file after streaming: {path}")
+        except Exception as e:
+            print(f"Error cleaning up streamed file {path}: {e}")
+        # Remove job metadata to avoid memory growth
+        jobs.pop(job_id, None)
+
+def cleanup_temp_dir(max_age_seconds: int = TEMP_FILE_MAX_AGE_SECONDS) -> int:
+    """Delete files in TEMP_DIR older than max_age_seconds. Returns number of deleted files."""
+    now = time.time()
+    deleted = 0
+    try:
+        for name in os.listdir(TEMP_DIR):
+            full_path = os.path.join(TEMP_DIR, name)
+            try:
+                if not os.path.isfile(full_path):
+                    continue
+                age = now - os.path.getmtime(full_path)
+                if age < max_age_seconds:
+                    continue
+                os.remove(full_path)
+                deleted += 1
+            except Exception:
+                # Ignore locked/in-use files; they'll be handled on a later pass
+                continue
+    except Exception:
+        return deleted
+    return deleted
+
+async def temp_cleanup_loop() -> None:
+    """Background task to keep TEMP_DIR from growing indefinitely."""
+    while True:
+        try:
+            deleted = cleanup_temp_dir()
+            if deleted:
+                print(f"Temp sweeper deleted {deleted} old file(s) from {TEMP_DIR}")
+        except Exception:
+            pass
+        await asyncio.sleep(TEMP_CLEANUP_INTERVAL_SECONDS)
+
+@app.on_event("startup")
+async def start_temp_cleanup() -> None:
+    asyncio.create_task(temp_cleanup_loop())
+
+def ydl_progress_hook(d, job_id):
+    """Update per-phase progress for the active job."""
+    job = jobs.get(job_id)
+    if not job:
+        return
+
+    info = d.get('info_dict') or {}
+    phase_key = 'audio_download' if info.get('vcodec') in (None, 'none') else 'video_download'
+    if job['type'] == 'audio':
+        phase_key = 'audio_download'
+
+    if d['status'] == 'downloading':
+        try:
+            percent_str = d.get('_percent_str', '0.0%')
+            percent = float(re.sub(r'\x1b\[[0-9;]*m', '', percent_str).strip('%'))
+            phase = job['phases'].get(phase_key)
+            if phase:
+                phase['status'] = 'downloading'
+                phase['progress'] = percent
+            job['status'] = 'processing'
+            update_overall_progress(job_id)
+        except Exception:
+            pass
+    elif d['status'] == 'finished':
+        phase = job['phases'].get(phase_key)
+        if phase:
+            phase['status'] = 'completed'
+            phase['progress'] = 100.0
+        update_overall_progress(job_id)
+
+def ydl_postprocessor_hook(d, job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return
+    pp_name = d.get('postprocessor')
+    status = d.get('status')
+    if job['type'] == 'audio' and pp_name == 'FFmpegExtractAudio':
+        phase_key = 'processing'
+    elif job['type'] == 'video' and pp_name == 'FFmpegMerger':
+        phase_key = 'merging'
+    else:
+        return
+
+    phase = job['phases'].get(phase_key)
+    if not phase:
+        return
+
+    if status == 'started':
+        phase['status'] = 'processing'
+        phase['progress'] = max(phase['progress'], 5.0)
+        simulate_phase_progress(job_id, phase_key)
+    elif status == 'finished':
+        phase['status'] = 'completed'
+        phase['progress'] = 100.0
+    update_overall_progress(job_id)
+
+# --- Routes ---
+
+@app.post("/info")
+async def get_video_info(request: VideoInfoRequest):
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(request.url, download=False)
+            
+            formats_list = []
+            
+            if request.type == 'audio':
+                # For audio, we just need one good option
+                formats_list.append({
+                    'format_id': 'bestaudio',
+                    'height': 0, # Signal it's audio
+                    'ext': 'mp3', # We will convert to mp3
+                    'filesize': None,
+                    'note': 'High Quality Audio (MP3)',
+                    'delivery': 'server',
+                    'direct_url': None,
+                })
+            else:
+                # For video, filter resolutions
+                seen_res = set()
+                available_formats = info.get('formats', [])
+                available_formats.sort(key=lambda x: x.get('height') or 0, reverse=True)
+
+                def pick_progressive(height: int):
+                    candidates = [
+                        f for f in available_formats
+                        if f.get('height') == height
+                        and f.get('vcodec') not in (None, 'none')
+                        and f.get('acodec') not in (None, 'none')
+                        and 'm3u8' not in str(f.get('protocol') or '')
+                        and 'dash' not in str(f.get('protocol') or '')
+                    ]
+                    if not candidates:
+                        return None
+                    candidates.sort(
+                        key=lambda x: (
+                            str(x.get('protocol') or '').startswith('https'),
+                            x.get('ext') == 'mp4',
+                            x.get('tbr') or 0,
+                            x.get('filesize') or 0,
+                        ),
+                        reverse=True,
+                    )
+                    best = candidates[0]
+                    return {
+                        'format_id': best.get('format_id'),
+                        'ext': best.get('ext'),
+                        'url': best.get('url'),
+                        'filesize': best.get('filesize'),
+                        'note': best.get('format_note') or best.get('format')
+                    }
+                
+                for f in available_formats:
+                    height = f.get('height')
+                    if not height: continue
+                    # Only allow standard resolutions
+                    if height not in seen_res and height in [2160, 1440, 1080, 720, 480]:
+                        progressive = pick_progressive(height) if height <= 720 else None
+                        direct_url = progressive.get('url') if progressive else None
+                        delivery = 'direct' if direct_url else 'server'
+                        formats_list.append({
+                            'format_id': progressive.get('format_id') if progressive and progressive.get('format_id') else f['format_id'],
+                            'height': height,
+                            'ext': progressive.get('ext') if progressive and progressive.get('ext') else 'mp4',
+                            'filesize': progressive.get('filesize') if progressive else f.get('filesize'),
+                            'note': (progressive.get('note') if progressive else f.get('format_note')),
+                            'delivery': delivery,
+                            'direct_url': direct_url,
+                        })
+                        seen_res.add(height)
+
+            return {
+                "title": info.get('title'),
+                "thumbnail": info.get('thumbnail'),
+                "duration": info.get('duration'),
+                "formats": formats_list
+            }
+    except Exception as e:
+        # Clean up error message
+        msg = str(e).replace('ERROR:', '').strip().split(';')[0]
+        raise HTTPException(status_code=400, detail=msg)
+
+def process_download(job_id: str, url: str, height: Optional[int], dl_type: str):
+    try:
+        jobs[job_id]['status'] = 'starting'
+        jobs[job_id]['progress'] = 0
+        
+        output_template = os.path.join(TEMP_DIR, f"{job_id}.%(ext)s")
+        
+        ydl_opts = {
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            # Add progress hook
+            'progress_hooks': [lambda d: ydl_progress_hook(d, job_id)],
+            'postprocessor_hooks': [lambda d: ydl_postprocessor_hook(d, job_id)],
+        }
+
+        if dl_type == 'audio':
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            })
+        else:
+            # Video mode: Merge best video at requested height + best audio
+            format_str = f"bestvideo[height={height}]+bestaudio/best[height={height}]/best"
+            ydl_opts.update({
+                'format': format_str,
+                'merge_output_format': 'mp4',
+            })
+        
+        jobs[job_id]['status'] = 'downloading'
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
+            # Find the actual file created
+            filename = None
+            if dl_type == 'audio':
+                 # yt-dlp postprocessor changes extension to mp3
+                 potential_filename = os.path.join(TEMP_DIR, f"{job_id}.mp3")
+                 if os.path.exists(potential_filename):
+                     filename = potential_filename
+            else:
+                 # Video merged to mp4
+                 potential_filename = os.path.join(TEMP_DIR, f"{job_id}.mp4")
+                 if os.path.exists(potential_filename):
+                     filename = potential_filename
+            
+            if filename and os.path.exists(filename):
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['progress'] = 100
+                for phase in jobs[job_id].get('phases', {}).values():
+                    phase['status'] = 'completed'
+                    phase['progress'] = 100.0
+                update_overall_progress(job_id)
+                jobs[job_id]['filename'] = filename
+                jobs[job_id]['title'] = info.get('title', 'download')
+            else:
+                raise Exception("File not found after processing")
+                
+    except Exception as e:
+        print(f"Job {job_id} failed: {e}")
+        jobs[job_id]['status'] = 'failed'
+        jobs[job_id]['error'] = str(e)
+        for phase in jobs[job_id].get('phases', {}).values():
+            if phase['status'] != 'completed':
+                phase['status'] = 'failed'
+
+        # Best-effort cleanup for partial leftovers (.part, temp fragments)
+        try:
+            for name in os.listdir(TEMP_DIR):
+                if name.startswith(job_id + "."):
+                    try:
+                        os.remove(os.path.join(TEMP_DIR, name))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+@app.post("/download")
+async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    # Basic server-side validation again
+    if not re.match(YOUTUBE_REGEX, request.url):
+         raise HTTPException(status_code=400, detail="Invalid URL")
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'queued',
+        'url': request.url,
+        'type': request.type,
+        'progress': 0,
+        'phases': initialize_phases(request.type)
+    }
+    background_tasks.add_task(process_download, job_id, request.url, request.height, request.type)
+    return {"job_id": job_id}
+
+@app.get("/status/{job_id}")
+async def get_status(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return jobs[job_id]
+
+@app.get("/file/{job_id}")
+async def get_file(job_id: str, background_tasks: BackgroundTasks):
+    if job_id not in jobs or jobs[job_id]['status'] != 'completed':
+        raise HTTPException(status_code=400, detail="File not ready")
+    
+    filename = jobs[job_id]['filename']
+    title = jobs[job_id]['title']
+    ext = "mp3" if jobs[job_id]['type'] == 'audio' else "mp4"
+    media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
+
+    # Sanitize filename for download headers
+    safe_title = re.sub(r'[\\/*?:"<>|]', "", title) # Remove bad characters
+    safe_filename = f"{safe_title}.{ext}"
+    
+    # Fallback cleanup in case client disconnect prevents generator finalizer
+    background_tasks.add_task(delete_file_delayed, filename, delay=600)
+
+    file_size = None
+    try:
+        file_size = os.path.getsize(filename)
+    except Exception:
+        file_size = None
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe_filename}"',
+    }
+    if file_size is not None:
+        headers["Content-Length"] = str(file_size)
+
+    return StreamingResponse(
+        stream_file_and_cleanup(job_id, filename),
+        media_type=media_type,
+        headers=headers,
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
