@@ -273,7 +273,7 @@ async def get_video_info(request: VideoInfoRequest):
             'no_warnings': True,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'web'],
+                    'player_client': ['tv'],
                 }
             },
             'http_headers': {
@@ -371,7 +371,7 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
                 'no_warnings': True,
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['android', 'web'],
+                        'player_client': ['tv'],
                     }
                 },
                 'http_headers': {
