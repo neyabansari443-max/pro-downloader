@@ -271,9 +271,10 @@ async def get_video_info(request: VideoInfoRequest):
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+            'cookiefile': 'cookies.txt',
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['tv'],
+                    'player_client': ['ios'],
                 }
             },
             'http_headers': {
@@ -369,9 +370,10 @@ async def process_download(job_id: str, url: str, height: Optional[int], dl_type
                 'outtmpl': output_template,
                 'quiet': True,
                 'no_warnings': True,
+                'cookiefile': 'cookies.txt',
                 'extractor_args': {
                     'youtube': {
-                        'player_client': ['tv'],
+                        'player_client': ['ios'],
                     }
                 },
                 'http_headers': {
